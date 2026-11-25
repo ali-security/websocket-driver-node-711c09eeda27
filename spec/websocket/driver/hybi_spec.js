@@ -1,4 +1,5 @@
 var Hybi = require("../../../lib/websocket/driver/hybi"),
+    deflate = require("permessage-deflate"),
     test = require('jstest').Test
 
 test.describe("Hybi", function() { with(this) {
@@ -562,6 +563,112 @@ test.describe("Hybi", function() { with(this) {
       driver().parse([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f])
       assertEqual( "Received unmasked frame but masking is required", error.message )
       assertEqual( [1003, "Received unmasked frame but masking is required"], close )
+    }})
+  }})
+
+  describe("with an extension that fails to process messages", function() { with(this) {
+    before(function() { with(this) {
+      var self = this
+
+      request().headers["sec-websocket-extensions"] = "x-fail"
+
+      driver().addExtension({
+        name: "x-fail", type: "permessage", rsv1: false, rsv2: false, rsv3: false,
+
+        createServerSession: function() {
+          return {
+            generateResponse: function() { return {} },
+            processIncomingMessage: function(message, callback) { callback(self.extensionError) },
+            processOutgoingMessage: function(message, callback) { callback(self.extensionError) },
+            close: function() {}
+          }
+        }
+      })
+
+      driver().start()
+    }})
+
+    describe("with a numeric error type", function() { with(this) {
+      before(function() { with(this) {
+        this.extensionError = new Error("message too large after decompression")
+        this.extensionError.type = 1009
+      }})
+
+      it("does not emit the incoming message", function() { with(this) {
+        driver().parse([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f])
+        assertEqual( "", message )
+      }})
+
+      it("closes the socket with the extension's code for incoming messages", function() { with(this) {
+        driver().parse([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f])
+        assertEqual( [0x88, 0x2f, 0x03, 0xf1], collector().bytes.slice(0,4) )
+        assertEqual( "x-fail: message too large after decompression", error.message )
+        assertEqual( [1009, "x-fail: message too large after decompression"], close )
+        assertEqual( "closed", driver().getState() )
+      }})
+
+      it("closes the socket with the extension's code for outgoing messages", function() { with(this) {
+        driver().frame("Hello")
+        assertEqual( [0x88, 0x2f, 0x03, 0xf1], collector().bytes.slice(0,4) )
+        assertEqual( "x-fail: message too large after decompression", error.message )
+        assertEqual( [1009, "x-fail: message too large after decompression"], close )
+        assertEqual( "closed", driver().getState() )
+      }})
+    }})
+
+    describe("without an error type", function() { with(this) {
+      before(function() { with(this) {
+        this.extensionError = new Error("could not process message")
+      }})
+
+      it("closes the socket with an extension error", function() { with(this) {
+        driver().parse([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f])
+        assertEqual( "", message )
+        assertEqual( [0x88, 0x23, 0x03, 0xf2], collector().bytes.slice(0,4) )
+        assertEqual( [1010, "x-fail: could not process message"], close )
+        assertEqual( "closed", driver().getState() )
+      }})
+    }})
+  }})
+
+  describe("with permessage-deflate", function() { with(this) {
+    define("compressionBomb", function() {
+      // 100,000 zero bytes compressed with raw DEFLATE and Z_SYNC_FLUSH, with
+      // the trailing 0x00 0x00 0xff 0xff removed, as sent by a client
+      var payload = [0xec, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0xf5, 0x4f, 0x6d, 0x0d, 0x0f, 0xa0]
+      while (payload.length < 111) payload.push(0x00)
+      payload.push(0x80, 0x57, 0x03)
+
+      return [0xc2, payload.length].concat(payload)
+    })
+
+    before(function() { with(this) {
+      options().maxLength = 1024
+      request().headers["sec-websocket-extensions"] = "permessage-deflate"
+      driver().addExtension(deflate)
+      driver().start()
+    }})
+
+    it("closes the socket instead of emitting a message that inflates past maxLength", function(resume) { with(this) {
+      var finished = false, inflatedLength = null
+
+      var finish = function() {
+        if (finished) return
+        finished = true
+
+        resume(function() { with(this) {
+          assertEqual( null, inflatedLength )
+          assertEqual( 1009, close[0] )
+          assertEqual( "closed", driver().getState() )
+        }})
+      }
+
+      driver().on("message", function(event) {
+        inflatedLength = event.data.length
+        finish()
+      })
+      driver().on("close", finish)
+      driver().parse(compressionBomb())
     }})
   }})
 
